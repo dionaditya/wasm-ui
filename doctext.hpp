@@ -308,6 +308,19 @@ inline ParaLayout LayoutParagraph(const char* text, std::vector<StyleSpan> spans
             if (j <= i) j = std::min(segEnd, i + std::max(1, U8Seq(text, i, n)));
             if (j > segEnd) j = segEnd;
 
+            // ImGui's wrap can only back up to a blank *inside the span it was
+            // given*. When the blank sits in a previous run (Word splits runs at
+            // arbitrary points), the break landed inside the word -- "atribut"
+            // became "atrib" + "ut." on the next line. If the break is mid-word
+            // and the line already has content, push the whole word to the next
+            // line instead.
+            if (j > i && j < segEnd && x > 0.5f &&
+                text[j] != ' ' && text[j] != '\t' && text[j] != '\n' &&
+                text[j - 1] != ' ') {
+                done = true;
+                break;                      // nothing consumed: new line starts at i
+            }
+
             Piece pc;
             pc.b0 = i; pc.b1 = j; pc.span = si; pc.x = x;
             if (sp.st.font)
