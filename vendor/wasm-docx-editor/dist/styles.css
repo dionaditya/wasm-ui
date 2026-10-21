@@ -1,0 +1,124 @@
+/* styles.css — the little chrome the DOM owns (the ribbon is drawn by ImGui
+   inside the canvas). Everything is driven by --docxed-* custom properties, so
+   a theme is a handful of variables. */
+
+.docxed-root {
+  --docxed-bg: #0b0f19;
+  --docxed-surface: #111827;
+  --docxed-border: #1f2937;
+  --docxed-text: #e8ecf4;
+  --docxed-muted: #94a3b8;
+  --docxed-accent: #38bdf8;
+  --docxed-radius: 10px;
+  --docxed-font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  min-height: 240px;
+  background: var(--docxed-bg);
+  color: var(--docxed-text);
+  border-radius: var(--docxed-radius);
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.docxed-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--docxed-surface);
+  border-bottom: 1px solid var(--docxed-border);
+  font: var(--docxed-font);
+  flex: 0 0 auto;
+}
+
+.docxed-btn {
+  appearance: none;
+  border: 1px solid var(--docxed-border);
+  background: #172033;
+  color: var(--docxed-text);
+  font: inherit;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.docxed-btn:hover { border-color: var(--docxed-accent); }
+.docxed-btn:active { transform: translateY(1px); }
+
+.docxed-spacer { flex: 1 1 auto; }
+
+.docxed-status {
+  font: 12px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--docxed-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 50%;
+}
+.docxed-status--bar {
+  padding: 6px 10px;
+  border-top: 1px solid var(--docxed-border);
+  background: var(--docxed-surface);
+  max-width: none;
+  flex: 0 0 auto;
+}
+
+.docxed-viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--docxed-bg);
+}
+
+/* SDL writes inline pixel sizes on the canvas when it creates the window;
+   !important keeps it filling the viewport, and mount() tells emscripten to
+   re-measure on resize. The canvas is absolutely positioned so it never feeds
+   its own intrinsic size back into the flex layout. */
+.docxed-viewport canvas.docxed-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+  outline: none;
+  touch-action: none;
+  image-rendering: optimizeSpeed;
+}
+
+.docxed-kb {
+  position: absolute;
+  top: -200px;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  border: 0;
+}
+
+.docxed-hidden-input {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.docxed-drop {
+  position: absolute;
+  inset: 8px;
+  display: none;
+  place-items: center;
+  border: 2px dashed var(--docxed-accent);
+  border-radius: var(--docxed-radius);
+  background: rgba(56, 189, 248, 0.08);
+  color: var(--docxed-accent);
+  font: 600 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  pointer-events: none;
+  z-index: 2;
+}
+.docxed-drop--active { display: grid; }

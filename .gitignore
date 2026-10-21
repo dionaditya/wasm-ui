@@ -1,24 +1,6 @@
-# build outputs (build.sh regenerates these from shell.html + sources)
-/index.html
-/index.js
-/index.wasm
-/index.data
-*.o
-
-# vendored third-party clones (see README: clone imgui next to main.cpp)
-/imgui/
-/cobbletext/
-/duckx_src/
-
-# python
-/.venv/
+# nothing here is generated: the demos import the vendored library builds directly
+node_modules/
+.venv/
 __pycache__/
 *.pyc
-
-# local documents and exports (may contain private material)
-test-*.docx
-*.pdf
-/output.docx
-
-# experimental vendored clone
-/imgui_colortext/
+.DS_Store

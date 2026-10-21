@@ -1,136 +1,66 @@
-# wasm-ui — a document editor in WebAssembly
+# wasm-ui — demo shell for two document libraries
 
-A word-processor style editor written in C++ with Dear ImGui and compiled to WebAssembly. It opens
-and saves Word `.docx` (OOXML), exports PDF, and runs entirely inside the browser tab — no server,
-no upload, nothing installed.
+This repository used to hold one large C++/Dear ImGui app that did both PDF reading and
+`.docx` editing. It is now a thin **demo shell**: the two halves live in their own repositories,
+each published as a JavaScript package with a vanilla API *and* React components.
 
-The screenshots below are a real Word document (a two-column academic paper, 314 paragraphs,
-5 sections, 9 tables, 13 images) imported into the editor:
-
-![Home ribbon](docs/screenshots/ribbon-home.png)
-
-## Ribbon
-
-Seven tabs, Office-style: **File** (page setup, open, export), **Home** (styles, font, size,
-bold/italic/underline/strike, super/subscript, colour, highlight, alignment, spacing, lists,
-undo/redo), **Insert** (image, header/footer, shapes, table, maths, diagrams, TOC/TOF/TOT),
-**Layout** (page setup, 1/2/3 columns, landscape), **References** (indexes, rules),
-**Review** (word/character count), **View** (zoom).
-
-| Insert | Layout | View |
+| library | what it does | repo |
 |---|---|---|
-| ![Insert](docs/screenshots/ribbon-insert.png) | ![Layout](docs/screenshots/ribbon-layout.png) | ![View](docs/screenshots/ribbon-view.png) |
+| **wasm-pdf-reader** | parse, rasterize and extract text from PDF files | [dionaditya/wasm-pdf-reader](https://github.com/dionaditya/wasm-pdf-reader) |
+| **wasm-docx-editor** | open, edit and save Word `.docx`; export PDF | [dionaditya/wasm-docx-editor](https://github.com/dionaditya/wasm-docx-editor) |
 
-## What it does
+**Live demos:** [PDF reader](https://dionaditya.github.io/wasm-ui/pdf/) ·
+[DOCX editor](https://dionaditya.github.io/wasm-ui/docx/)
 
-- **Editing** — caret/selection across paragraphs, typing with undo/redo, find and replace,
-  clipboard with formatting.
-- **Character formatting** — bold, italic, underline, strike, super/subscript, colour, highlight,
-  size, and eight embedded font families with real bold/italic faces (DejaVu plus
-  Liberation/Carlito/Caladea as free metric-compatible replacements for Arial, Times New Roman,
-  Courier New, Calibri and Cambria).
-- **Paragraphs** — left/centre/right/justified, space before/after, line spacing, first-line and
-  hanging indents, tab stops with leaders, lists, horizontal rules.
-- **Tables** — insert and edit in place; column widths, per-side borders, cell shading and cell
-  alignment imported from `w:tblGrid`/`w:tblPr`/`w:tcPr`.
-- **Pages** — page size, orientation, margins, newspaper columns, header/footer text with page
-  numbers, per-page setup, continuous and next-page section breaks.
-- **Objects** — inline and floating images, shapes, LaTeX maths and Mermaid/Graphviz diagrams
-  rendered to embedded images.
-- **References** — table of contents, list of figures, list of tables, generated from headings and
-  captions.
-- **Files** — `.docx` import, `.docx` export, PDF export. Styles (`styles.xml`, `basedOn` chains,
-  `docDefaults`), run fonts, section properties and table styling are read from the file rather
-  than approximated.
-
-### Typography against Word
-
-Measured on the paper in the screenshots (Word and LibreOffice both paginate it to 10 pages):
-
-| | Word / LibreOffice | wasm-ui |
-|---|---|---|
-| body face and size | Times New Roman 12 pt | Liberation Serif 12 pt (metric-compatible) |
-| line pitch | 14.45 pt | 14.4 pt |
-| first page content | 3314 characters | 3317 characters |
-| pages | 10 | 9 |
-| PDF export | — | strict-parse clean, 0 overlapping glyphs |
-
-The remaining page-count difference is table and figure pagination, not type metrics.
-
-## Known limitations
-
-OOXML support is partial and measured, not assumed: footnotes/endnotes, comments, tracked changes,
-fields, numbering definitions and table merges are not imported yet, and the `.docx` writer emits
-direct formatting rather than named styles. The full audit, per-part matrices and the roadmap are in
-[docs/OOXML-COMPATIBILITY.md](docs/OOXML-COMPATIBILITY.md) and [docs/PLAN.md](docs/PLAN.md).
-
-Silent data loss is the honest risk: a document with footnotes or tracked changes opens with those
-parts dropped. Treat it as an editor for straightforward documents, not as a Word replacement.
-
-## How it compares
-
-| | wasm-ui | Collabora Online | ZetaOffice (LibreOffice in wasm) |
-|---|---|---|---|
-| engine | own model, layout and OOXML reader (~2 MB wasm) | LibreOffice, native, server-side | LibreOffice, compiled to wasm |
-| document location | stays in the tab | uploaded, rendered on the server | stays in the tab |
-| OOXML fidelity | partial (measured above) | LibreOffice's | LibreOffice's |
-| collaboration | none | real-time multi-user | none |
-| footprint | 2 MB, no backend | container stack, CPU per session | ~250 MB runtime |
-
-## Security
-
-The parser is wasm: a malformed `.docx` can corrupt the module's own linear memory but cannot read
-files, exec a process or escape the browser sandbox. Nothing is uploaded, and macros, OLE objects and
-external relationships are never executed — they are dropped. Caveats: the demo server (`main.py`)
-has no authentication, a hostile file can still exhaust memory (denial of service), and unsupported
-features are dropped rather than rejected.
-
-## Build
-
-Requirements: [emsdk](https://emscripten.org/docs/getting_started/downloads.html) on `PATH`
-(`. ~/emsdk/emsdk_env.sh`), and Dear ImGui cloned next to `main.cpp`:
-
-```bash
-git clone --depth 1 https://github.com/ocornut/imgui imgui
-./build.sh          # produces index.html, index.js, index.wasm, index.data
-```
-
-`fonts_data.h` is generated from the embedded TTFs by `tools/fonts/build_fonts.py`; it is committed
-so the build works without the font sources.
-
-## Run
-
-```bash
-python3 -m venv .venv && ./.venv/bin/pip install flask
-./.venv/bin/python main.py        # http://127.0.0.1:5555/
-```
-
-Any static file server works too; `main.py` just disables caching so rebuilds show up.
-
-## Repository layout
+## Layout
 
 ```
-main.cpp                 UI, document model, layout, PDF writer, OOXML import/export
-doctext.hpp              line layout, hit-testing, justified text, selection rects
-pdf_widths.h             standard-14 font metrics used by the PDF writer
-fonts_data.h             embedded subset TTFs + font family table
-shell.html               the JS shell (file pickers, image/maths decode, exports)
-build.sh                 emscripten build
-main.py                  tiny Flask host
-duckx/                   patched duckx (OOXML writer) + pugixml + miniz
-tools/fonts/             font subsetter / header generator
-tools/ooxml-corpus/      one .docx fixture per OOXML feature area
-tools/ooxml-check/       headless import/export probes, strict PDF + overlap checks
-docs/                    roadmap and OOXML compatibility audit
+index.html             landing page (links to both demos)
+pdf/                   mountPdfReader() demo + sample.pdf
+docx/                  mountDocEditor() demo + sample.docx
+vendor/
+  wasm-pdf-reader/dist/  latest build from that repo's main branch
+  wasm-docx-editor/dist/ latest build from that repo's main branch
+assets/                thumbnails for the landing page
 ```
 
-## Tests
+There is no build step here: the shell imports each library straight from `vendor/`, so what you
+see in the demo is exactly what those repositories publish (`dist/` is committed there too).
+The vendored PDF reader is the latest one — 4 GB wasm heap, streamed file load, and
+calibre-style object streams.
 
-`tools/ooxml-check` drives the real wasm module in headless Chromium: it imports every corpus
-fixture, dumps the model, exports `.docx`/`.pdf`, and asserts strict-PDF structure (no repair
-tolerance) plus zero overlapping glyphs. See [tools/ooxml-check/README.md](tools/ooxml-check/README.md).
+## Refresh a vendored library
 
-## Licences
+```sh
+# PDF reader — straight from its main branch
+cd /path/to/wasm-pdf-reader && git archive main dist | tar -x -C /path/to/wasm-ui/vendor/wasm-pdf-reader
 
-Application code: MIT (see `LICENSE`). Dear ImGui: MIT. duckx, pugixml, miniz: MIT.
-DejaVu fonts: Bitstream Vera licence. Liberation, Carlito, Caladea: SIL Open Font Licence.
+# DOCX editor — build it, then copy the output
+cd /path/to/wasm-docx-editor && ./build.sh && node scripts/build-js.mjs
+cp -r dist /path/to/wasm-ui/vendor/wasm-docx-editor/dist
+```
+
+## Run locally
+
+Any static server works; the wasm `.wasm`/`.data` pair only needs correct MIME types.
+
+```sh
+python3 -m http.server 8080      # then open http://127.0.0.1:8080/
+```
+
+## Deployment
+
+`.github/workflows/pages.yml` publishes the repository root to GitHub Pages on every push to
+`main` (`.nojekyll` keeps the folder names intact). The same tree is also pushed to a `gh-pages`
+branch.
+
+## History
+
+The original single-app source (C++ editor + native PDF parser + emscripten shell) is in this
+repository's git history before this commit; the live code is now:
+`wasm-docx-editor/main.cpp` (+ `doctext.hpp`, `duckx/`, `pdf_widths.h`, `fonts_data.h`) and
+`wasm-pdf-reader/src/cpp/` (pdfdoc, pdfraster, wpdf_api).
+
+## License
+
+MIT — see [LICENSE](LICENSE). Both libraries are MIT as well.

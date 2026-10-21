@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wasm-docx-editor — vanilla JS demo</title>
+<link rel="stylesheet" href="../vendor/wasm-docx-editor/dist/styles.css">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; display: flex; flex-direction: column;
+    background: radial-gradient(1200px 600px at 15% -10%, #16233a, #080b12 60%);
+    color: #e8ecf4; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 12px 18px; border-bottom: 1px solid #1f2937; background: rgba(9, 13, 22, 0.9);
+  }
+  header h1 { font-size: 15px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  header h1 span { color: #7dd3fc; font-weight: 500; }
+  header .sub { color: #94a3b8; font-size: 12.5px; }
+  header .spacer { flex: 1 1 auto; }
+  header a { color: #7dd3fc; font-size: 12.5px; text-decoration: none; }
+  header a:hover { text-decoration: underline; }
+  button {
+    appearance: none; border: 1px solid #263143; background: #172033; color: #e8ecf4;
+    font: inherit; padding: 6px 11px; border-radius: 7px; cursor: pointer;
+  }
+  button:hover { border-color: #38bdf8; }
+  button.primary { background: #1d4ed8; border-color: #2563eb; }
+  #status { color: #94a3b8; font-size: 12.5px; }
+  main { flex: 1 1 auto; min-height: 0; padding: 14px; }
+  #editor { height: 100%; border: 1px solid #1f2937; border-radius: 12px; overflow: hidden; }
+  footer { padding: 8px 18px 14px; color: #64748b; font-size: 12px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #a5f3fc; }
+</style>
+</head>
+<body>
+<header>
+  <h1>wasm-docx-editor <span>· vanilla JS</span></h1>
+  <span class="sub">Word .docx in the browser tab — C++ / Dear ImGui compiled to WebAssembly</span>
+  <span class="spacer"></span>
+  <button id="open" class="primary">Open .docx</button>
+  <button id="sample">Open sample</button>
+  <button id="docx">Export .docx</button>
+  <button id="pdf">Export PDF</button>
+  <span id="status">booting…</span>
+  <a href="../">← all demos</a>
+</header>
+
+<main><div id="editor"></div></main>
+
+<footer>
+  Mounted with <code>mountDocEditor(el, { file })</code> from
+  <code>@dionaditya/wasm-docx-editor</code>. Everything runs in the tab: no server, no upload.
+</footer>
+
+<script type="module">
+import { mountDocEditor } from '../vendor/wasm-docx-editor/dist/index.js';
+
+const status = document.getElementById('status');
+const setStatus = (s) => { status.textContent = s; };
+
+const viewer = mountDocEditor('#editor', {
+  height: '100%',
+  theme: { radius: '12px' },
+  onOpen: (info) => setStatus(`${info.name || 'document'}: ${info.paragraphs} paragraphs`),
+  onError: (err) => setStatus('error: ' + err.message),
+});
+
+window.demo = viewer;
+
+document.getElementById('open').addEventListener('click', () => viewer.editor.pickDocx((f) => {
+  viewer.open(f, { filename: f.name }).catch((e) => setStatus(e.message));
+}));
+
+document.getElementById('sample').addEventListener('click', async () => {
+  setStatus('loading sample…');
+  try {
+    await viewer.open('./sample.docx', { filename: 'sample.docx' });
+  } catch (e) { setStatus(e.message); }
+});
+
+document.getElementById('docx').addEventListener('click', () =>
+  viewer.exportDocx('document.docx').then(() => setStatus('exported document.docx')).catch((e) => setStatus(e.message)));
+
+document.getElementById('pdf').addEventListener('click', () =>
+  viewer.exportPdf('document.pdf').then(() => setStatus('exported document.pdf')).catch((e) => setStatus(e.message)));
+</script>
+</body>
+</html>
