@@ -180,7 +180,7 @@
           }
         }, 200);
 
-        // PDF file input is wired up by the MuPDF module script below
+        // PDF file input is wired up by the native-PDF script below
 
         // ── DOCX import: local file → wasm heap → document model ──────────
         // A picker created on demand works where a hidden, permanently-attached
@@ -423,57 +423,31 @@
 
     window.onerror = function(msg) { console.error('onerror:', msg); };
   </script>
-  <!-- MuPDF.js: C++ PDF engine compiled to WASM — handles rendering, we handle GL textures -->
-  <script type="module">
-    // mupdf exports its namespace directly (not a factory function)
-    const mupdf = await import('https://cdn.jsdelivr.net/npm/mupdf/dist/mupdf.js');
-    window.MuPDF = mupdf;
-    let mupdfDoc = null;
-
-    window.renderPdfPage = function(pageIdx) {
-      if (!mupdfDoc || !window.Module) return;
-      try {
-        const scale = 1.5;
-        const page    = mupdfDoc.loadPage(pageIdx);
-        const matrix  = mupdf.Matrix.scale(scale, scale);
-        const pixmap  = page.toPixmap(matrix, mupdf.ColorSpace.DeviceRGB, false, true);
-        const rgb     = pixmap.getPixels();
-        const w       = pixmap.getWidth();
-        const h       = pixmap.getHeight();
-
-        // Convert RGB → RGBA
-        const rgba = new Uint8Array(w * h * 4);
-        for (let i = 0; i < w * h; i++) {
-          rgba[i*4]   = rgb[i*3];
-          rgba[i*4+1] = rgb[i*3+1];
-          rgba[i*4+2] = rgb[i*3+2];
-          rgba[i*4+3] = 255;
-        }
-
-        const ptr = Module._malloc(rgba.length);
-        Module.HEAPU8.set(rgba, ptr);
-        Module.ccall('pdf_receive_page', null,
-          ['number','number','number','number'], [ptr, w, h, pageIdx]);
+  <!-- PDF: parsed and rasterized natively in C++ (pdf/pdfdoc.cpp + pdf/pdfraster.cpp).
+       The only JS left is the file picker -> wasm heap handoff. -->
+  <script>
+    (function () {
+      window.pdfOpenFromBuffer = function (buffer, name) {
+        if (!window.Module || !Module._malloc) return -1;
+        var bytes = new Uint8Array(buffer);
+        var ptr = Module._malloc(bytes.length);
+        if (!ptr) return -1;
+        Module.HEAPU8.set(bytes, ptr);
+        var n = Module.ccall('pdf_open_document', 'number', ['number', 'number'], [ptr, bytes.length]);
         Module._free(ptr);
+        console.log('pdf_open_document(' + (name || '') + ') -> ' + n + ' pages');
+        return n;
+      };
 
-        pixmap.destroy();
-        page.destroy();
-      } catch(e) {
-        console.error('renderPdfPage error:', e);
-      }
-    };
-
-    document.getElementById('pdf-file-input').addEventListener('change', async function(e) {
-      const file = e.target.files[0];
-      if (!file) return;
-      const buf = await file.arrayBuffer();
-      if (mupdfDoc) { try { mupdfDoc.destroy(); } catch(_) {} mupdfDoc = null; }
-      mupdfDoc = mupdf.Document.openDocument(buf, 'application/pdf');
-      const n = mupdfDoc.countPages();
-      Module.ccall('pdf_set_page_count', null, ['number'], [n]);
-      renderPdfPage(0);
-      e.target.value = '';
-    });
+      document.getElementById('pdf-file-input').addEventListener('change', function (e) {
+        var file = e.target.files && e.target.files[0];
+        if (!file) return;
+        var reader = new FileReader();
+        reader.onload = function (evt) { window.pdfOpenFromBuffer(evt.target.result, file.name); };
+        reader.readAsArrayBuffer(file);
+        e.target.value = '';
+      });
+    })();
   </script>
   {{{ SCRIPT }}}
   <style>

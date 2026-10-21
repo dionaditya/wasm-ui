@@ -1,6 +1,9 @@
 #include "imgui/imgui.h"
 #include "fonts_data.h"   // embedded document faces + family table
 #include "pdf_widths.h"
+#include "pdf/pdfdoc.hpp"    // native PDF parser (no MuPDF, no JS)
+#include "pdf/pdfraster.hpp" // native PDF rasterizer -> RGBA -> GL texture
+#include <chrono>
 #include "imgui/backends/imgui_impl_sdl2.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
 #include <SDL.h>
@@ -422,33 +425,235 @@ static struct PdfState {
     int   text_annot_idx = -1;
     std::string status;
     bool loading = false;
+
+    // native renderer state
+    pdf::Document      doc;
+    std::vector<pdf::RenderStats> stats;
+    // text layer per page (page space, points, y up) + current selection
+    std::vector<std::vector<pdf::TextItem>> page_text;
+    int   sel_a = -1, sel_b = -1;   // selected item range on the current page
+    bool  sel_dragging = false;
+    int   sel_page = -1;
+    int   render_ms   = 0;
+    int   page_w_pt   = 612, page_h_pt = 792;
+    bool  tried_autoload = false;
+    std::string doc_name;
 } gPdf;
 
+// Scale the page is rasterized at; the zoom slider rescales the texture in the
+// shader-free path (ImGui draws a textured quad, i.e. OpenGL).
+static const double kPdfRenderScale = 1.5;
+
+static void PdfUploadTexture(int idx, const pdf::Image& img)
+{
+    auto& p = gPdf.pages[idx];
+    if (!p.id) glGenTextures(1, &p.id);
+    glBindTexture(GL_TEXTURE_2D, p.id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.w, img.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.rgba.data());
+    p.w = img.w;
+    p.h = img.h;
+}
+
+static bool PdfRenderPageNative(int idx, double scale)
+{
+    if (!gPdf.doc.loaded || idx < 0 || idx >= gPdf.page_count) return false;
+    auto t0 = std::chrono::steady_clock::now();
+    pdf::Image img;
+    pdf::RenderStats st;
+    pdf::Renderer r(&gPdf.doc);
+    if (!r.renderPage(idx, scale, img, &st)) {
+        gPdf.status = "render failed (page " + std::to_string(idx + 1) + ")";
+        return false;
+    }
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    PdfUploadTexture(idx, img);
+    if ((int)gPdf.stats.size() <= idx) gPdf.stats.resize(idx + 1);
+    gPdf.stats[idx] = st;
+    if ((int)gPdf.page_text.size() <= idx) gPdf.page_text.resize(idx + 1);
+    gPdf.page_text[idx] = r.textItems();
+    gPdf.render_ms = (int)ms;
+    return true;
+}
+
+static bool PdfLoadBytes(const uint8_t* data, int len, const char* name)
+{
+    for (auto& p : gPdf.pages) if (p.id) glDeleteTextures(1, &p.id);
+    gPdf.pages.clear();
+    gPdf.annots.clear();
+    gPdf.sel_annot = -1;
+    gPdf.cur_page  = 0;
+    gPdf.page_count = 0;
+    gPdf.stats.clear();
+    gPdf.page_text.clear();
+    gPdf.sel_a = gPdf.sel_b = -1;
+    gPdf.sel_dragging = false;
+    gPdf.doc = pdf::Document();
+    auto t0 = std::chrono::steady_clock::now();
+    if (!gPdf.doc.load(data, (size_t)len)) {
+        gPdf.status = std::string("Cannot read PDF: ") + gPdf.doc.error;
+        return false;
+    }
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    gPdf.page_count = gPdf.doc.pageCount();
+    gPdf.pages.assign(gPdf.page_count, PdfState::PageTex{});
+    gPdf.stats.assign(gPdf.page_count, pdf::RenderStats());
+    gPdf.doc_name = name && *name ? name : "document";
+    double w = 612, h = 792; int rot = 0;
+    gPdf.doc.pageSize(0, w, h, rot);
+    gPdf.page_w_pt = (int)lround(w);
+    gPdf.page_h_pt = (int)lround(h);
+    bool ok = PdfRenderPageNative(0, kPdfRenderScale);
+    gPdf.status = gPdf.doc_name + ": " + std::to_string(gPdf.page_count) + " pages, parsed in " +
+                  std::to_string(ms) + " ms" + (ok ? ", page 1 rendered in " +
+                  std::to_string(gPdf.render_ms) + " ms" : std::string(", render failed"));
+    return true;
+}
+
+static bool PdfLoadFileNative(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0) { fclose(f); return false; }
+    std::vector<uint8_t> buf((size_t)n);
+    size_t got = fread(buf.data(), 1, (size_t)n, f);
+    fclose(f);
+    if (got != (size_t)n) return false;
+    const char* base = strrchr(path, '/');
+    return PdfLoadBytes(buf.data(), (int)buf.size(), base ? base + 1 : path);
+}
+
+// ── text selection -----------------------------------------------------------
+// Annotation coords live in texture pixels; the text layer lives in page points.
+static inline float PdfPxPerPt() { return (float)kPdfRenderScale; }
+
+// item index under a page-space point, or -1
+static int PdfTextHit(const std::vector<pdf::TextItem>& items, float pxpt, float pypt)
+{
+    for (int i = (int)items.size() - 1; i >= 0; i--) {
+        const auto& it = items[i];
+        if (it.text.empty()) continue;
+        // a little vertical slack: glyph boxes are tight around the baseline
+        if (pxpt >= it.x0 - 0.6f && pxpt <= it.x1 + 0.6f &&
+            pypt >= it.y0 - 1.0f && pypt <= it.y1 + 1.0f)
+            return i;
+    }
+    // fall back to the nearest item on the same visual line
+    int best = -1;
+    float bestD = 4.0f;
+    for (int i = 0; i < (int)items.size(); i++) {
+        const auto& it = items[i];
+        if (it.text.empty()) continue;
+        if (pypt < it.y0 - 1.0f || pypt > it.y1 + 1.0f) continue;
+        float dx = pxpt < it.x0 ? it.x0 - pxpt : (pxpt > it.x1 ? pxpt - it.x1 : 0.f);
+        if (dx < bestD) { bestD = dx; best = i; }
+    }
+    return best;
+}
+
+static std::string PdfSelectedText()
+{
+    if (gPdf.sel_page != gPdf.cur_page) return std::string();
+    if (gPdf.cur_page >= (int)gPdf.page_text.size()) return std::string();
+    const auto& items = gPdf.page_text[gPdf.cur_page];
+    int a = gPdf.sel_a, b = gPdf.sel_b;
+    if (a < 0 || b < 0 || items.empty()) return std::string();
+    if (a > b) std::swap(a, b);
+    a = std::max(0, a); b = std::min((int)items.size() - 1, b);
+    std::string out;
+    const pdf::TextItem* prev = nullptr;
+    for (int i = a; i <= b; i++) {
+        const auto& it = items[i];
+        if (prev) {
+            float fs = prev->fs > 0.1f ? prev->fs : 10.f;
+            bool newLine = std::fabs(it.oy - prev->oy) > fs * 0.5f;
+            if (newLine) {
+                out += '\n';
+            } else {
+                // a real space shows up as a gap beyond the previous advance
+                float gap = it.ox - (prev->ox + prev->adv);
+                if (gap > fs * 0.14f && !out.empty() && out.back() != '\n') out += ' ';
+            }
+        }
+        out += it.text;
+        prev = &it;
+    }
+    return out;
+}
+
+static void PdfCopySelection()
+{
+    std::string s = PdfSelectedText();
+    if (s.empty()) return;
+    EM_ASM({
+        var t = UTF8ToString($0);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(t);
+        } else {
+            var ta = document.createElement('textarea');
+            ta.value = t; document.body.appendChild(ta); ta.select();
+            document.execCommand('copy'); document.body.removeChild(ta);
+        }
+    }, s.c_str());
+    gPdf.status = "copied " + std::to_string(s.size()) + " characters";
+}
+
 extern "C" {
-    EMSCRIPTEN_KEEPALIVE void pdf_set_page_count(int n) {
-        for (auto& p : gPdf.pages) if (p.id) glDeleteTextures(1, &p.id);
-        gPdf.pages.assign(n, PdfState::PageTex{});
-        gPdf.page_count = n;
-        gPdf.cur_page   = 0;
-        gPdf.annots.clear();
-        gPdf.sel_annot  = -1;
-        gPdf.loading    = false;
-        gPdf.status     = std::to_string(n) + " pages";
+    // Parse + rasterize a PDF entirely in C++. Returns the page count, or < 0.
+    EMSCRIPTEN_KEEPALIVE int pdf_open_document(const uint8_t* data, int len) {
+        if (!PdfLoadBytes(data, len, "document.pdf")) return -1;
+        return gPdf.page_count;
     }
-    EMSCRIPTEN_KEEPALIVE void pdf_receive_page(const uint8_t* pixels, int w, int h, int page_idx) {
-        if (page_idx < 0 || page_idx >= (int)gPdf.pages.size()) return;
-        auto& p = gPdf.pages[page_idx];
-        if (!p.id) glGenTextures(1, &p.id);
-        glBindTexture(GL_TEXTURE_2D, p.id);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-        p.w = w; p.h = h;
+    EMSCRIPTEN_KEEPALIVE int pdf_open_file(const char* path) {
+        if (!PdfLoadFileNative(path)) return -1;
+        return gPdf.page_count;
     }
+    // Rasterize one page into its OpenGL texture. Returns 1 on success.
+    EMSCRIPTEN_KEEPALIVE int pdf_render_page(int idx, float scale) {
+        return PdfRenderPageNative(idx, scale > 0.1f ? (double)scale : kPdfRenderScale) ? 1 : 0;
+    }
+    EMSCRIPTEN_KEEPALIVE int pdf_page_count() { return gPdf.page_count; }
     EMSCRIPTEN_KEEPALIVE void pdf_open_picker() {
-        EM_ASM({ document.getElementById('pdf-file-input').click(); });
+        EM_ASM({ var el = document.getElementById('pdf-file-input'); if (el) el.click(); });
+    }
+    EMSCRIPTEN_KEEPALIVE const char* pdf_selected_debug() {
+        static std::string out;
+        out = PdfSelectedText();
+        return out.c_str();
+    }
+    EMSCRIPTEN_KEEPALIVE int pdf_text_item_count() {
+        if (gPdf.cur_page >= (int)gPdf.page_text.size()) return 0;
+        return (int)gPdf.page_text[gPdf.cur_page].size();
+    }
+    EMSCRIPTEN_KEEPALIVE const char* pdf_doc_debug() {
+        static std::string js;
+        int unsupported = 0, glyphs = 0;
+        std::string notes;
+        for (auto& st : gPdf.stats) {
+            unsupported += st.unsupported;
+            glyphs += st.glyphs;
+            if (notes.size() < 160 && !st.notes.empty()) { notes += st.notes.substr(0, 160); notes += " "; }
+        }
+        js = "{\"loaded\":" + std::string(gPdf.doc.loaded ? "true" : "false") +
+             ",\"pages\":" + std::to_string(gPdf.page_count) +
+             ",\"page\":" + std::to_string(gPdf.cur_page + 1) +
+             ",\"tex_w\":" + std::to_string(gPdf.pages.empty() ? 0 : gPdf.pages[0].w) +
+             ",\"tex_h\":" + std::to_string(gPdf.pages.empty() ? 0 : gPdf.pages[0].h) +
+             ",\"render_ms\":" + std::to_string(gPdf.render_ms) +
+             ",\"glyphs\":" + std::to_string(glyphs) +
+             ",\"unsupported\":" + std::to_string(unsupported) +
+             ",\"notes\":\"" + notes + "\""
+             ",\"status\":\"" + gPdf.status + "\"}";
+        return js.c_str();
     }
 }
 
@@ -720,11 +925,22 @@ static void TabPdfEditor()
     float W = ImGui::GetContentRegionAvail().x;
     float H = ImGui::GetContentRegionAvail().y;
 
+    // The reference paper ships with the module: open it on first draw so the
+    // tab is never empty.
+    if (gPdf.sel_a >= 0 && gPdf.sel_page == gPdf.cur_page && ImGui::GetIO().KeyCtrl &&
+        ImGui::IsKeyPressed(ImGuiKey_C, false))
+        PdfCopySelection();
+
+    if (!gPdf.tried_autoload && !gPdf.doc.loaded) {
+        gPdf.tried_autoload = true;
+        PdfLoadFileNative("/compressed.tracemonkey-pldi-09.pdf");
+    }
+
     // toolbar
     ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.10f, 0.14f, 0.22f, 1.f});
     ImGui::BeginChild("##pdftb", {W, 40.f}, ImGuiChildFlags_None);
     ImGui::SetCursorPosY(6.f);
-    if (ImGui::Button("Open PDF", {90, 26})) EM_ASM({ document.getElementById('pdf-file-input').click(); });
+    if (ImGui::Button("Open PDF", {90, 26})) pdf_open_picker();
     ImGui::SameLine(0, 10);
     const char* tools[] = {"Select", "Text", "Rect", "Highlight", "Draw"};
     for (int t = 0; t < 5; t++) {
@@ -743,14 +959,16 @@ static void TabPdfEditor()
     if (gPdf.page_count > 0) {
         if (ImGui::Button("<", {26, 26}) && gPdf.cur_page > 0) {
             gPdf.cur_page--;
-            EM_ASM({ window.renderPdfPage && window.renderPdfPage($0); }, gPdf.cur_page);
+            gPdf.sel_a = gPdf.sel_b = -1; gPdf.sel_dragging = false;
+            if (!gPdf.pages[gPdf.cur_page].id) PdfRenderPageNative(gPdf.cur_page, kPdfRenderScale);
         }
         ImGui::SameLine();
         ImGui::Text("%d / %d", gPdf.cur_page + 1, gPdf.page_count);
         ImGui::SameLine();
         if (ImGui::Button(">", {26, 26}) && gPdf.cur_page + 1 < gPdf.page_count) {
             gPdf.cur_page++;
-            EM_ASM({ window.renderPdfPage && window.renderPdfPage($0); }, gPdf.cur_page);
+            gPdf.sel_a = gPdf.sel_b = -1; gPdf.sel_dragging = false;
+            if (!gPdf.pages[gPdf.cur_page].id) PdfRenderPageNative(gPdf.cur_page, kPdfRenderScale);
         }
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, Col::muted);
@@ -758,7 +976,21 @@ static void TabPdfEditor()
         ImGui::PopStyleColor();
     }
     ImGui::SameLine(0, 16);
+    if (gPdf.sel_a >= 0 && gPdf.sel_page == gPdf.cur_page) {
+        if (ImGui::Button("Copy text", {86, 26})) PdfCopySelection();
+    } else {
+        ImGui::BeginDisabled();
+        ImGui::Button("Copy text", {86, 26});
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine(0, 16);
     ImGui::Text("%d annotations", (int)gPdf.annots.size());
+    if (!gPdf.status.empty()) {
+        ImGui::SameLine(0, 16);
+        ImGui::PushStyleColor(ImGuiCol_Text, Col::muted);
+        ImGui::TextUnformatted(gPdf.status.c_str());
+        ImGui::PopStyleColor();
+    }
     ImGui::EndChild();
     ImGui::PopStyleColor();
 
@@ -784,6 +1016,25 @@ static void TabPdfEditor()
         ImGui::Dummy({1.f, pageH + 32.f});
         dl->AddRectFilled({px + 3, py + 3}, {px + pageW + 3, py + pageH + 3}, IM_COL32(0,0,0,60));
         dl->AddImage(tex, {px, py}, {px + pageW, py + pageH});
+
+        // ── selected text layer ────────────────────────────────────────────
+        const std::vector<pdf::TextItem>* curItems = nullptr;
+        if (gPdf.sel_page == gPdf.cur_page && gPdf.cur_page < (int)gPdf.page_text.size())
+            curItems = &gPdf.page_text[gPdf.cur_page];
+        if (curItems && gPdf.sel_a >= 0 && gPdf.sel_b >= 0 && !curItems->empty()) {
+            int a = std::min(gPdf.sel_a, gPdf.sel_b), b = std::max(gPdf.sel_a, gPdf.sel_b);
+            a = std::max(0, a); b = std::min((int)curItems->size() - 1, b);
+            const ImU32 selCol = IM_COL32(64, 132, 255, 90);
+            for (int i = a; i <= b; i++) {
+                const auto& it = (*curItems)[i];
+                if (it.text.empty()) continue;
+                float sx0 = px + it.x0 * PdfPxPerPt() * gPdf.zoom;
+                float sx1 = px + it.x1 * PdfPxPerPt() * gPdf.zoom;
+                float sy0 = py + (gPdf.page_h_pt - it.y1) * PdfPxPerPt() * gPdf.zoom;
+                float sy1 = py + (gPdf.page_h_pt - it.y0) * PdfPxPerPt() * gPdf.zoom;
+                dl->AddRectFilled({sx0 - 1.f, sy0 - 1.f}, {sx1 + 1.f, sy1 + 1.f}, selCol);
+            }
+        }
 
         ImGui::SetCursorPos({(W - pageW) * 0.5f, 16.f});
         ImGui::InvisibleButton("##pdfsurface", {pageW, pageH});
@@ -817,11 +1068,39 @@ static void TabPdfEditor()
             float ly = (mp.y - py) / gPdf.zoom;
             if (gPdf.tool == PdfState::Select) {
                 gPdf.sel_annot = -1;
-                for (int i = (int)gPdf.annots.size() - 1; i >= 0; i--) {
-                    PdfState::Annot& a = gPdf.annots[i];
-                    if (a.page != gPdf.cur_page) continue;
-                    if (lx >= a.x && lx <= a.x + a.w && ly >= a.y && ly <= a.y + a.h) {
-                        gPdf.sel_annot = i; break;
+                // text first: selecting words is what this tool is for
+                int hit = -1;
+                if (gPdf.cur_page < (int)gPdf.page_text.size()) {
+                    const auto& items = gPdf.page_text[gPdf.cur_page];
+                    float pptx = lx / PdfPxPerPt();
+                    float ppty = gPdf.page_h_pt - ly / PdfPxPerPt();
+                    hit = PdfTextHit(items, pptx, ppty);
+                }
+                if (hit >= 0) {
+                    gPdf.sel_page = gPdf.cur_page;
+                    if (ImGui::IsMouseDoubleClicked(0)) {
+                        // whole word: extend while items stay on one line with no gap
+                        const auto& items = gPdf.page_text[gPdf.cur_page];
+                        int a = hit, b = hit;
+                        auto lineOf = [&](int i) { return items[i].y0; };
+                        while (a > 0 && std::fabs(lineOf(a - 1) - lineOf(hit)) < 2.f &&
+                               items[a].x0 - items[a - 1].x1 < 3.5f) a--;
+                        while (b + 1 < (int)items.size() && std::fabs(lineOf(b + 1) - lineOf(hit)) < 2.f &&
+                               items[b + 1].x0 - items[b].x1 < 3.5f) b++;
+                        gPdf.sel_a = a; gPdf.sel_b = b;
+                    } else {
+                        gPdf.sel_a = gPdf.sel_b = hit;
+                        gPdf.sel_dragging = true;
+                    }
+                } else {
+                    gPdf.sel_a = gPdf.sel_b = -1;
+                    gPdf.sel_dragging = false;
+                    for (int i = (int)gPdf.annots.size() - 1; i >= 0; i--) {
+                        PdfState::Annot& a = gPdf.annots[i];
+                        if (a.page != gPdf.cur_page) continue;
+                        if (lx >= a.x && lx <= a.x + a.w && ly >= a.y && ly <= a.y + a.h) {
+                            gPdf.sel_annot = i; break;
+                        }
                     }
                 }
             } else if (gPdf.tool == PdfState::TextTool) {
@@ -860,14 +1139,22 @@ static void TabPdfEditor()
                 a.h = fabsf(ly - gPdf.drag_start.y);
             }
         }
-        if (!ImGui::IsMouseDown(0)) gPdf.drawing = false;
+        if (gPdf.sel_dragging && ImGui::IsMouseDown(0) && gPdf.sel_page == gPdf.cur_page &&
+            gPdf.cur_page < (int)gPdf.page_text.size()) {
+            const auto& items = gPdf.page_text[gPdf.cur_page];
+            float lx = (mp.x - px) / gPdf.zoom / PdfPxPerPt();
+            float ly = (mp.y - py) / gPdf.zoom / PdfPxPerPt();
+            int hit = PdfTextHit(items, lx, gPdf.page_h_pt - ly);
+            if (hit >= 0) gPdf.sel_b = hit;
+        }
+        if (!ImGui::IsMouseDown(0)) { gPdf.drawing = false; gPdf.sel_dragging = false; }
         if (hovered) ImGui::SetMouseCursor(gPdf.tool == PdfState::Select
                                             ? ImGuiMouseCursor_Arrow : ImGuiMouseCursor_Hand);
     } else {
         ImGui::Dummy({1.f, chH - 40.f});
         ImGui::PushStyleColor(ImGuiCol_Text, Col::muted);
         ImGui::SetCursorPos({W * 0.5f - 140.f, chH * 0.4f});
-        ImGui::TextUnformatted("Open a PDF to annotate it (MuPDF renders the pages).");
+        ImGui::TextUnformatted("Open a PDF to annotate it (rendered natively in C++).");
         ImGui::PopStyleColor();
     }
     ImGui::EndChild();
